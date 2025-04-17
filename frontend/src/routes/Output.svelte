@@ -16,6 +16,7 @@
         selectedSource,
         type StreamInfo,
     } from "../stores/streams";
+    import ScoreOverlay from "../components/ScoreOverlay.svelte";
 
     // --- State ---
     let localRoom: Room | null = $state(null);
@@ -68,7 +69,43 @@
         const selected = $selectedSource; // Track dependency
         if (selected && selected !== activeSourceSid) {
             console.log("Selected source changed externally:", selected);
-            activeSourceSid = selected;
+            switchToSource(selected);
+        }
+    });
+
+    // Function to handle source switching logic
+    function switchToSource(targetSid: string) {
+        activeSourceSid = targetSid;
+
+        // Check if this stream exists in our streams array
+        const targetStream = allStreams.find(
+            (s) => s.participant.sid === targetSid,
+        );
+        if (!targetStream) {
+            console.log(
+                "Selected stream not found in current streams, may need to reconnect",
+            );
+            // If we're in final mode but don't have the selected stream, try to reconnect
+            if ($mode === "final") {
+                console.log("Reconnecting to LiveKit to get missing streams");
+                connectLiveKit();
+            }
+        } else {
+            console.log(
+                `Switched to source ${targetSid}, angle: ${targetStream.angle || "unknown"}`,
+            );
+        }
+    }
+
+    // Effect to attach media tracks when they become available
+    $effect(() => {
+        // When in finals mode, ensure we have selected a source if available
+        if ($mode === "final" && angleStreams.length > 0 && !activeSourceSid) {
+            console.log("Auto-selecting first available angle in finals mode");
+            // Make sure participant exists and has a valid sid
+            if (angleStreams[0]?.participant?.sid) {
+                switchToSource(angleStreams[0].participant.sid);
+            }
         }
     });
 
@@ -157,6 +194,17 @@
             ws.onmessage = (event) => {
                 try {
                     const data = JSON.parse(event.data);
+
+                    // Process source switch commands
+                    if (data.action === "switch_source" && data.targetSid) {
+                        console.log(
+                            `Received switch source command via WebSocket: ${data.targetSid}`,
+                        );
+                        processSourceSwitchCommand(data);
+                        return;
+                    }
+
+                    // Process score updates
                     $scores = data; // Update score store
                     if (data.phase && data.phase !== $mode) {
                         console.log("Mode changed via WebSocket:", data.phase);
@@ -175,36 +223,56 @@
     // --- LiveKit Connection ---
     async function connectLiveKit() {
         try {
+            // First, clean up any existing room connection
+            if (localRoom) {
+                try {
+                    console.log("Disconnecting from existing LiveKit room");
+                    await localRoom.disconnect();
+                } catch (err) {
+                    console.error("Error disconnecting from room:", err);
+                }
+                localRoom = null;
+            }
+
             $connectionState.livekit = "connecting";
             const currentMode = $mode; // Use stable value within async function
 
             // Get token
-            const apiBaseUrl = import.meta.env.VITE_API_URL || "http://localhost:8080";
+            const apiBaseUrl =
+                import.meta.env.VITE_API_URL || "http://localhost:8080";
             const response = await fetch(
                 `${apiBaseUrl}/api/token?type=output&phase=${currentMode}`,
                 { method: "GET" },
             );
             if (!response.ok) {
-                throw new Error(`Failed to get token: ${response.status} ${response.statusText}`);
+                throw new Error(
+                    `Failed to get token: ${response.status} ${response.statusText}`,
+                );
             }
-            
+
             // Debug the raw response before parsing
             const responseText = await response.text();
             console.log("Token API response:", responseText);
-            
+
             // Try to parse the response as JSON
             let tokenData;
             try {
                 tokenData = JSON.parse(responseText);
             } catch (parseErr) {
                 console.error("JSON parse error:", parseErr);
-                throw new Error(`Invalid JSON response from token API: ${responseText.substring(0, 100)}...`);
+                throw new Error(
+                    `Invalid JSON response from token API: ${responseText.substring(0, 100)}...`,
+                );
             }
-            
+
             const { token, room: roomName } = tokenData;
 
             // Create and connect room
-            const room = new Room();
+            const room = new Room({
+                // Enable auto-subscribe to tracks
+                adaptiveStream: true,
+                dynacast: true,
+            });
             localRoom = room; // Assign to state
 
             try {
@@ -213,15 +281,22 @@
                 await room.connect(livekitUrl, token);
                 console.log("LiveKit connected to room:", roomName);
                 $connectionState.livekit = "connected";
-            } catch (connectErr: any) { // Type annotation to handle unknown type
+            } catch (connectErr: any) {
+                // Type annotation to handle unknown type
                 console.error("LiveKit room.connect error:", connectErr);
-                
+
                 // Check for specific API key error
-                if (connectErr.message && connectErr.message.includes("invalid API key")) {
-                    $connectionState.errorMessage = "LiveKit API key is invalid or expired. Please contact the administrator.";
-                    throw new Error("LiveKit connection failed: Invalid API key. The API key may be expired or misconfigured.");
+                if (
+                    connectErr.message &&
+                    connectErr.message.includes("invalid API key")
+                ) {
+                    $connectionState.errorMessage =
+                        "LiveKit API key is invalid or expired. Please contact the administrator.";
+                    throw new Error(
+                        "LiveKit connection failed: Invalid API key. The API key may be expired or misconfigured.",
+                    );
                 }
-                
+
                 throw connectErr; // Re-throw to be caught by outer try block
             }
 
@@ -241,8 +316,8 @@
             console.error("LiveKit connection error:", err);
             $connectionState.livekit = "error";
             $connectionState.errorMessage =
-                err instanceof Error 
-                    ? `${err.name}: ${err.message}` 
+                err instanceof Error
+                    ? `${err.name}: ${err.message}`
                     : "Unknown error";
             if (localRoom) {
                 await localRoom.disconnect();
@@ -388,43 +463,61 @@
         console.log(
             `Track subscribed: ${track.kind} from ${participant.identity} (SID: ${track.sid})`,
         );
-        
+
         // Update stream info
         updateStreamPublication(participant.sid, publication, true);
-        
+
         // Directly attach tracks
         if (track.kind === "video") {
             // For video tracks, find the right video element
             let elementId: string | null = null;
-            
+
             // Check if this is for a semi-final or final stream
-            const streamInfo = allStreams.find(s => s.participant.sid === participant.sid);
+            const streamInfo = allStreams.find(
+                (s) => s.participant.sid === participant.sid,
+            );
             if (streamInfo) {
-                if (streamInfo.phase === "semi" && streamInfo.game === "game1") {
+                if (
+                    streamInfo.phase === "semi" &&
+                    streamInfo.game === "game1"
+                ) {
                     elementId = `video-game1-${participant.sid}`;
-                } else if (streamInfo.phase === "semi" && streamInfo.game === "game2") {
+                } else if (
+                    streamInfo.phase === "semi" &&
+                    streamInfo.game === "game2"
+                ) {
                     elementId = `video-game2-${participant.sid}`;
                 } else if (streamInfo.phase === "final") {
                     elementId = `video-final-${participant.sid}`;
                 } else {
                     elementId = `video-${participant.sid}`;
                 }
-                
+
                 // Try to attach the track immediately
-                const videoEl = document.getElementById(elementId) as HTMLVideoElement | null;
+                const videoEl = document.getElementById(
+                    elementId,
+                ) as HTMLVideoElement | null;
                 if (videoEl) {
                     console.log(`Attaching video track to ${elementId}`);
                     track.attach(videoEl);
                 } else {
                     // If video element doesn't exist yet, try again after a delay
-                    console.log(`Video element ${elementId} not found, trying again in 500ms`);
+                    console.log(
+                        `Video element ${elementId} not found, trying again in 500ms`,
+                    );
                     setTimeout(() => {
-                        const retryEl = document.getElementById(elementId!) as HTMLVideoElement | null;
+                        const retryEl = document.getElementById(
+                            elementId!,
+                        ) as HTMLVideoElement | null;
                         if (retryEl) {
-                            console.log(`Delayed attachment to ${elementId} successful`);
+                            console.log(
+                                `Delayed attachment to ${elementId} successful`,
+                            );
                             track.attach(retryEl);
                         } else {
-                            console.warn(`Failed to find video element ${elementId} after delay`);
+                            console.warn(
+                                `Failed to find video element ${elementId} after delay`,
+                            );
                         }
                     }, 500);
                 }
@@ -449,24 +542,49 @@
     ) {
         try {
             const data = JSON.parse(new TextDecoder().decode(payload));
+            console.log("Received data message:", data);
+
             if (data.action === "switch_source" && data.targetSid) {
-                console.log("Received switch source command:", data.targetSid);
-                // Ensure the target SID actually exists among angle streams
-                if (
-                    angleStreams.some(
-                        (s) => s.participant.sid === data.targetSid,
-                    )
-                ) {
-                    activeSourceSid = data.targetSid;
-                } else {
-                    console.warn(
-                        "Received switch command for non-existent/non-final stream:",
-                        data.targetSid,
-                    );
-                }
+                console.log(
+                    `Received switch source command via DataChannel: ${data.targetSid}`,
+                );
+
+                // Process the switch command
+                processSourceSwitchCommand(data);
             }
         } catch (err) {
             console.error("Error processing data message:", err);
+        }
+    }
+
+    // Process source switch commands from either WebSocket or DataChannel
+    function processSourceSwitchCommand(data: any) {
+        if (!data.targetSid) return;
+
+        // Ensure the target SID actually exists among angle streams
+        const targetStream = allStreams.find(
+            (s) => s.participant.sid === data.targetSid,
+        );
+
+        if (targetStream && targetStream.phase === "final") {
+            console.log(
+                `Switching to source ${data.targetSid}, angle: ${targetStream.angle || "unknown"}`,
+            );
+            switchToSource(data.targetSid);
+        } else {
+            console.warn(
+                "Received switch command for non-existent/non-final stream:",
+                data.targetSid,
+                targetStream ? `(phase: ${targetStream.phase})` : "(not found)",
+            );
+
+            // If we can't find the stream, it might be because we need to reconnect
+            if ($mode === "final" && !targetStream) {
+                console.log(
+                    "Target stream not found, reconnecting to LiveKit to get missing streams",
+                );
+                connectLiveKit();
+            }
         }
     }
 
@@ -498,12 +616,17 @@
         <div class="error-overlay">
             <div class="error-message">
                 <h3>Connection Error</h3>
-                <p>{$connectionState.errorMessage || "Failed to connect to video stream."}</p>
-                <button onclick={() => connectLiveKit()}>Retry Connection</button>
+                <p>
+                    {$connectionState.errorMessage ||
+                        "Failed to connect to video stream."}
+                </p>
+                <button onclick={() => connectLiveKit()}
+                    >Retry Connection</button
+                >
             </div>
         </div>
     {/if}
-    
+
     <!-- Semi-finals mode -->
     {#if $mode === "semi"}
         <div class="semi-output">
@@ -529,18 +652,8 @@
                             </div>
                             <!-- Score overlay for Game 1 -->
                             {#if $scores?.scores?.game1}
-                                <div class="score-overlay">
-                                    {#each Object.entries($scores.scores.game1) as [className, score], i}
-                                        <div class="team-score">
-                                            <span class="team-name"
-                                                >{className}</span
-                                            >
-                                            <span class="score">{score}</span>
-                                        </div>
-                                        {#if i === 0}<div class="score-divider">
-                                                :
-                                            </div>{/if}
-                                    {/each}
+                                <div class="overlay-wrapper">
+                                    <ScoreOverlay scores={$scores.scores.game1} variant="semi" />
                                 </div>
                             {/if}
                         {/key}
@@ -572,18 +685,8 @@
                             </div>
                             <!-- Score overlay for Game 2 -->
                             {#if $scores?.scores?.game2}
-                                <div class="score-overlay">
-                                    {#each Object.entries($scores.scores.game2) as [className, score], i}
-                                        <div class="team-score">
-                                            <span class="team-name"
-                                                >{className}</span
-                                            >
-                                            <span class="score">{score}</span>
-                                        </div>
-                                        {#if i === 0}<div class="score-divider">
-                                                :
-                                            </div>{/if}
-                                    {/each}
+                                <div class="overlay-wrapper">
+                                    <ScoreOverlay scores={$scores.scores.game2} variant="semi" />
                                 </div>
                             {/if}
                         {/key}
@@ -614,16 +717,8 @@
                     </div>
                     <!-- Score overlay for Finals -->
                     {#if $scores?.scores?.final}
-                        <div class="score-overlay final">
-                            {#each Object.entries($scores.scores.final) as [className, score], i}
-                                <div class="team-score">
-                                    <span class="team-name">{className}</span>
-                                    <span class="score">{score}</span>
-                                </div>
-                                {#if i === 0}<div class="score-divider">
-                                        :
-                                    </div>{/if}
-                            {/each}
+                        <div class="overlay-wrapper">
+                          <ScoreOverlay scores={$scores.scores.final} variant="final" />
                         </div>
                     {/if}
                 {/key}
@@ -698,50 +793,14 @@
         text-align: center;
     }
 
-    .score-overlay {
+    .overlay-wrapper {
         position: absolute;
         top: 1rem;
         left: 50%;
         transform: translateX(-50%);
-        background-color: rgba(0, 0, 0, 0.7);
-        padding: 0.5rem 1rem;
-        border-radius: 4px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        color: white;
         z-index: 10; /* Ensure overlay is above video */
     }
 
-    .score-overlay.final {
-        padding: 0.75rem 1.5rem;
-        font-size: 1.2rem;
-    }
-
-    .team-score {
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        padding: 0 0.5rem;
-    }
-
-    .team-name {
-        font-size: 0.9rem;
-        font-weight: bold;
-        white-space: nowrap;
-    }
-
-    .score {
-        font-size: 1.8rem;
-        font-weight: bold;
-    }
-
-    .score-divider {
-        font-size: 1.8rem;
-        margin: 0 0.5rem;
-        font-weight: bold;
-    }
-    
     /* Error display styles */
     .error-overlay {
         position: absolute;
@@ -755,7 +814,7 @@
         align-items: center;
         justify-content: center;
     }
-    
+
     .error-message {
         background-color: #f8d7da;
         border: 1px solid #f5c2c7;
@@ -765,12 +824,12 @@
         max-width: 90%;
         text-align: center;
     }
-    
+
     .error-message h3 {
         margin-top: 0;
         font-size: 1.5rem;
     }
-    
+
     .error-message button {
         margin-top: 1rem;
         padding: 0.5rem 1rem;
@@ -780,7 +839,7 @@
         border-radius: 4px;
         cursor: pointer;
     }
-    
+
     .error-message button:hover {
         background-color: #0b5ed7;
     }

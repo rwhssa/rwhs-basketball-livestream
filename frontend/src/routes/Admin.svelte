@@ -35,7 +35,9 @@
         ),
     );
     let angleStreams = $derived(
-        streams.filter((s) => s.phase === "final" && s.videoPublication),
+        streams.filter(
+            (s) => s.phase === "final" && s.videoPublication
+        ),
     );
 
     // Update the availableStreams store
@@ -92,6 +94,17 @@
     // Connect to LiveKit
     async function connectLiveKit() {
         try {
+            // First, clean up any existing room connection
+            if (localRoom) {
+                try {
+                    console.log("Disconnecting from existing LiveKit room");
+                    await localRoom.disconnect();
+                } catch (err) {
+                    console.error("Error disconnecting from room:", err);
+                }
+                localRoom = null;
+            }
+            
             $connectionState.livekit = "connecting";
             const currentMode = $mode; // Use stable value within async function
 
@@ -127,7 +140,11 @@
             const { token, room: roomName } = tokenData;
 
             // Connect to LiveKit room
-            const room = new Room();
+            const room = new Room({
+                // Enable auto-subscribe to tracks
+                adaptiveStream: true,
+                dynacast: true
+            });
             localRoom = room;
 
             try {
@@ -189,6 +206,7 @@
         try {
             if (participant.metadata) {
                 const metadata = JSON.parse(participant.metadata);
+                console.log("Participant metadata:", metadata);
 
                 // Only add camera participants to the streams array
                 if (metadata.phase) {
@@ -196,12 +214,19 @@
                     const streamInfo: StreamInfo = {
                         participant,
                         phase: metadata.phase,
-                        game: metadata.game,
-                        angle: metadata.angle,
+                        game: metadata.game || "final",
+                        angle: metadata.angle || "main",
                     };
 
                     // Add to streams array
                     streams = [...streams, streamInfo];
+                    console.log(`Added stream: phase=${metadata.phase}, game=${metadata.game}, angle=${metadata.angle}`);
+
+                    // If in final mode, make sure we have a selected source
+                    if ($mode === "final" && metadata.phase === "final" && !$selectedSource) {
+                        $selectedSource = participant.sid;
+                        console.log(`Auto-selected source in finals mode: ${participant.sid}`);
+                    }
 
                     // Subscribe to any existing publications
                     participant.trackPublications.forEach((publication) => {
@@ -237,6 +262,21 @@
         
         // First, update the publication in our streams array
         processTrackPublication(participant, publication);
+        
+        // Check if we're in finals mode and need to set an initial source
+        if ($mode === "final" && track.kind === "video" && !$selectedSource) {
+            try {
+                if (participant.metadata) {
+                    const metadata = JSON.parse(participant.metadata);
+                    if (metadata.phase === "final") {
+                        console.log(`Auto-selecting first finals source: ${participant.sid}`);
+                        $selectedSource = participant.sid;
+                    }
+                }
+            } catch (err) {
+                console.error("Error checking participant metadata:", err);
+            }
+        }
         
         // Then, immediately attach the track if it's video
         if (track.kind === "video") {
@@ -304,29 +344,54 @@
             if (stream) {
                 if (publication.kind === "video") {
                     stream.videoPublication = publication;
+                    console.log(`Updated video publication for participant ${participant.sid}`);
+                    
+                    // If this is a final stream and we need to select a source, do it now
+                    if (stream.phase === "final" && $mode === "final" && !$selectedSource) {
+                        console.log(`Auto-selecting source in finals mode: ${participant.sid}`);
+                        $selectedSource = participant.sid;
+                    }
                 } else if (publication.kind === "audio") {
                     stream.audioPublication = publication;
+                    console.log(`Updated audio publication for participant ${participant.sid}`);
                 }
 
                 streams = updatedStreams;
             }
+        } else {
+            console.warn(`Cannot find stream for participant ${participant.sid} to update publication`);
         }
     }
 
     // Switch to selected source in finals mode
     function switchSource(participantSid: string) {
-        if (!localRoom || $mode !== "final") return;
+        if ($mode !== "final") {
+            console.warn("Cannot switch source: not in finals mode");
+            return;
+        }
+        
+        if (!localRoom) {
+            console.error("Cannot switch source: no LiveKit room connection");
+            return;
+        }
+        
         const participant = localRoom.localParticipant;
-        if (!participant) return;
+        if (!participant) {
+            console.error("Cannot switch source: no local participant");
+            return;
+        }
 
         try {
+            console.log(`Switching to source: ${participantSid}`);
+            
             // Update the selected source store
             $selectedSource = participantSid;
 
-            // Send message via DataChannel to Output
+            // 1. Send via DataChannel to Output
             const message = JSON.stringify({
                 action: "switch_source",
                 targetSid: participantSid,
+                timestamp: Date.now()
             });
 
             participant.publishData(
@@ -334,7 +399,44 @@
                 { reliable: true },
             );
 
-            console.log("Source switch message sent:", participantSid);
+            console.log("DataChannel source switch message sent:", participantSid);
+            
+            // 2. Also send via WebSocket for redundancy if available
+            if (wsConnection && wsConnection.readyState === WebSocket.OPEN) {
+                try {
+                    const wsMessage = JSON.stringify({
+                        action: "switch_source",
+                        targetSid: participantSid,
+                        timestamp: Date.now()
+                    });
+                    wsConnection.send(wsMessage);
+                    console.log("WebSocket source switch message sent:", participantSid);
+                } catch (wsErr) {
+                    console.error("Failed to send source switch via WebSocket:", wsErr);
+                }
+            }
+            
+            // 3. Try sending the message again after a short delay to ensure delivery
+            setTimeout(() => {
+                if (localRoom && localRoom.localParticipant) {
+                    try {
+                        const delayedMessage = JSON.stringify({
+                            action: "switch_source",
+                            targetSid: participantSid,
+                            timestamp: Date.now(),
+                            retry: true
+                        });
+                        
+                        localRoom.localParticipant.publishData(
+                            new Uint8Array(new TextEncoder().encode(delayedMessage)),
+                            { reliable: true },
+                        );
+                        console.log("Delayed source switch message sent:", participantSid);
+                    } catch (retryErr) {
+                        console.error("Failed to send delayed source switch message:", retryErr);
+                    }
+                }
+            }, 1000);
         } catch (err) {
             console.error("Error switching source:", err);
         }
@@ -342,11 +444,33 @@
 
     // Toggle between semi and final modes
     function toggleMode() {
-        $mode = $mode === "semi" ? "final" : "semi";
+        const newMode = $mode === "semi" ? "final" : "semi";
+        $mode = newMode;
+
+        // Notify output via WebSocket if connection exists
+        if (wsConnection && wsConnection.readyState === WebSocket.OPEN) {
+            try {
+                const message = JSON.stringify({
+                    action: "mode_change",
+                    mode: newMode
+                });
+                wsConnection.send(message);
+                console.log(`Mode change notification sent: ${newMode}`);
+            } catch (err) {
+                console.error("Failed to send mode change notification:", err);
+            }
+        }
 
         // Reconnect to LiveKit when mode changes
         if (localRoom) {
             localRoom.disconnect();
+            // Clear current streams when switching modes
+            streams = [];
+            // Wait for disconnect to complete before reconnecting
+            setTimeout(() => {
+                connectLiveKit();
+            }, 500);
+        } else {
             connectLiveKit();
         }
     }
@@ -491,17 +615,33 @@
                                 
                                 {#key stream.participant.sid}
                                     {@const attachVideo = () => {
-                                        setTimeout(() => {
-                                            const videoEl = document.getElementById(
-                                                `video-${stream.participant.sid}`
-                                            ) as HTMLVideoElement;
-                                            if (videoEl && stream.videoPublication?.track) {
-                                                console.log(`Attaching Game 1 video track for ${stream.participant.sid}`);
-                                                stream.videoPublication.track.attach(videoEl);
-                                            } else {
-                                                console.warn(`Cannot attach Game 1 video: element or track missing for ${stream.participant.sid}`);
-                                            }
-                                        }, 100);
+                                        if (stream.videoPublication?.track) {
+                                            setTimeout(() => {
+                                                const videoEl = document.getElementById(
+                                                    `video-${stream.participant.sid}`
+                                                ) as HTMLVideoElement;
+                                                if (videoEl) {
+                                                    console.log(`Attaching Game 1 video track for ${stream.participant.sid}`);
+                                                    if (stream.videoPublication && stream.videoPublication.track) {
+                                                        stream.videoPublication.track.attach(videoEl);
+                                                    }
+                                                } else {
+                                                    console.warn(`Cannot attach Game 1 video: element missing for ${stream.participant.sid}`);
+                                                    // Try again with a longer delay
+                                                    setTimeout(() => {
+                                                        const retryEl = document.getElementById(
+                                                            `video-${stream.participant.sid}`
+                                                        ) as HTMLVideoElement;
+                                                        if (retryEl && stream.videoPublication?.track) {
+                                                            console.log(`Delayed attachment to Game 1 successful for ${stream.participant.sid}`);
+                                                            stream.videoPublication.track.attach(retryEl);
+                                                        }
+                                                    }, 500);
+                                                }
+                                            }, 100);
+                                        } else {
+                                            console.warn(`Cannot attach Game 1 video: track missing for ${stream.participant.sid}`);
+                                        }
                                     }}
                                     {attachVideo()}
                                 {/key}
@@ -543,17 +683,33 @@
 
                                 {#key stream.participant.sid}
                                     {@const attachVideo = () => {
-                                        setTimeout(() => {
-                                            const videoEl = document.getElementById(
-                                                `video-${stream.participant.sid}`
-                                            ) as HTMLVideoElement;
-                                            if (videoEl && stream.videoPublication?.track) {
-                                                console.log(`Attaching Game 2 video track for ${stream.participant.sid}`);
-                                                stream.videoPublication.track.attach(videoEl);
-                                            } else {
-                                                console.warn(`Cannot attach Game 2 video: element or track missing for ${stream.participant.sid}`);
-                                            }
-                                        }, 100);
+                                        if (stream.videoPublication?.track) {
+                                            setTimeout(() => {
+                                                const videoEl = document.getElementById(
+                                                    `video-${stream.participant.sid}`
+                                                ) as HTMLVideoElement;
+                                                if (videoEl) {
+                                                    console.log(`Attaching Game 2 video track for ${stream.participant.sid}`);
+                                                    if (stream.videoPublication && stream.videoPublication.track) {
+                                                        stream.videoPublication.track.attach(videoEl);
+                                                    }
+                                                } else {
+                                                    console.warn(`Cannot attach Game 2 video: element missing for ${stream.participant.sid}`);
+                                                    // Try again with a longer delay
+                                                    setTimeout(() => {
+                                                        const retryEl = document.getElementById(
+                                                            `video-${stream.participant.sid}`
+                                                        ) as HTMLVideoElement;
+                                                        if (retryEl && stream.videoPublication?.track) {
+                                                            console.log(`Delayed attachment to Game 2 successful for ${stream.participant.sid}`);
+                                                            stream.videoPublication.track.attach(retryEl);
+                                                        }
+                                                    }, 500);
+                                                }
+                                            }, 100);
+                                        } else {
+                                            console.warn(`Cannot attach Game 2 video: track missing for ${stream.participant.sid}`);
+                                        }
                                     }}
                                     {attachVideo()}
                                 {/key}
@@ -618,17 +774,33 @@
 
                                 {#key stream.participant.sid}
                                     {@const attachVideo = () => {
-                                        setTimeout(() => {
-                                            const videoEl = document.getElementById(
-                                                `video-${stream.participant.sid}`
-                                            ) as HTMLVideoElement;
-                                            if (videoEl && stream.videoPublication?.track) {
-                                                console.log(`Attaching angle video track for ${stream.participant.sid}`);
-                                                stream.videoPublication.track.attach(videoEl);
-                                            } else {
-                                                console.warn(`Cannot attach angle video: element or track missing for ${stream.participant.sid}`);
-                                            }
-                                        }, 100);
+                                        if (stream.videoPublication?.track) {
+                                            setTimeout(() => {
+                                                const videoEl = document.getElementById(
+                                                    `video-${stream.participant.sid}`
+                                                ) as HTMLVideoElement;
+                                                if (videoEl) {
+                                                    console.log(`Attaching angle video track for ${stream.participant.sid}`);
+                                                    if (stream.videoPublication && stream.videoPublication.track) {
+                                                        stream.videoPublication.track.attach(videoEl);
+                                                    }
+                                                } else {
+                                                    console.warn(`Cannot attach angle video: element missing for ${stream.participant.sid}`);
+                                                    // Try again with a longer delay
+                                                    setTimeout(() => {
+                                                        const retryEl = document.getElementById(
+                                                            `video-${stream.participant.sid}`
+                                                        ) as HTMLVideoElement;
+                                                        if (retryEl && stream.videoPublication?.track) {
+                                                            console.log(`Delayed attachment to angle successful for ${stream.participant.sid}`);
+                                                            stream.videoPublication.track.attach(retryEl);
+                                                        }
+                                                    }, 500);
+                                                }
+                                            }, 100);
+                                        } else {
+                                            console.warn(`Cannot attach angle video: track missing for ${stream.participant.sid}`);
+                                        }
                                     }}
                                     {attachVideo()}
                                 {/key}
@@ -794,6 +966,7 @@
         display: grid;
         grid-template-columns: 1fr 1fr;
         gap: 1rem;
+        margin-top: 1rem;
     }
 
     .angle-preview {
@@ -803,10 +976,13 @@
         aspect-ratio: 9/16; /* Vertical video ratio */
         border: 3px solid transparent;
         transition: border-color 0.3s;
+        background-color: #222;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
     }
 
     .angle-preview.selected {
         border-color: #0066cc;
+        box-shadow: 0 0 0 3px rgba(0, 102, 204, 0.5), 0 2px 8px rgba(0, 0, 0, 0.3);
     }
 
     .angle-controls {
@@ -814,7 +990,7 @@
         bottom: 0;
         left: 0;
         right: 0;
-        padding: 0.5rem;
+        padding: 0.75rem;
         background-color: rgba(0, 0, 0, 0.7);
         color: white;
         display: flex;
@@ -823,18 +999,21 @@
     }
 
     .angle-label {
-        font-size: 0.9rem;
+        font-size: 1rem;
         font-weight: bold;
+        text-transform: uppercase;
     }
 
     .select-btn {
-        padding: 0.25rem 0.5rem;
+        padding: 0.5rem 0.75rem;
         background-color: #0066cc;
         color: white;
         border: none;
         border-radius: 4px;
-        font-size: 0.8rem;
+        font-size: 0.9rem;
         cursor: pointer;
+        font-weight: bold;
+        transition: all 0.2s ease;
     }
 
     .select-btn.active {
@@ -843,5 +1022,6 @@
 
     .select-btn:hover {
         background-color: #005bb5;
+        transform: translateY(-2px);
     }
 </style>

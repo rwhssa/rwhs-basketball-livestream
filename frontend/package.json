@@ -1,0 +1,22 @@
+{
+  "name": "basketball-livestream-frontend",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "check": "svelte-check --tsconfig ./tsconfig.json"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^3.1.2",
+    "@tsconfig/svelte": "^5.0.4",
+    "svelte": "^5.27.1",
+    "svelte-check": "^3.8.6",
+    "typescript": "^5.8.3",
+    "vite": "^5.4.18"
+  },
+  "dependencies": {
+    "livekit-client": "^2.11.2"
+  }
+}

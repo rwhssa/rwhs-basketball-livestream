@@ -1,0 +1,35 @@
+port: 7880
+rtc:
+  tcp_port: 7881
+  udp_port: 7882
+  use_external_ip: true
+  # When deployed to production, uncomment and set these fields
+  # ice_servers:
+  #   - urls:
+  #       - stun:stun.l.google.com:19302
+  #   - urls:
+  #       - turn:turn.example.com:3478
+  #     username: "your_turn_username"
+  #     credential: "your_turn_credential"
+
+logging:
+  level: info
+
+# key pairs for token generation
+keys:
+  # These will be replaced by environment variables
+  "apikey": "secret"
+
+# Redis is recommended for production deployments
+# redis:
+#   address: redis:6379
+#   db: 0
+#   username: ""
+#   password: ""
+
+# Room configuration
+room:
+  enable_remote_unmute: true
+  max_participants: 50
+  empty_timeout: 300 # 5 minutes in seconds
+  # max_duration removed as it's not supported in this version

@@ -33,10 +33,14 @@ async fn main() -> anyhow::Result<()> {
     let config = config::load_config()?;
     info!("Configuration loaded");
 
+    // Create broadcast channel for score updates
+    let (score_tx, _) = tokio::sync::broadcast::channel::<axum::extract::ws::Message>(100);
+    
     // Create shared application state
     let state = Arc::new(AppState {
         scores: Mutex::new(None),
         config: Arc::new(config),
+        score_tx,
     });
 
     // Set up CORS

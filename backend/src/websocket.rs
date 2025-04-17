@@ -20,12 +20,8 @@ pub async fn ws_handler(
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let (mut sender, mut receiver) = socket.split();
 
-    // Create a broadcast channel for score updates
-    let (tx, _rx) = broadcast::channel(100);
-    let mut rx = tx.subscribe();
-
-    // Clone state for the sender task
-    let state_clone = state.clone();
+    // Subscribe to the broadcast channel for score updates
+    let mut rx = state.score_tx.subscribe();
 
     // Spawn task to forward messages from broadcast to websocket
     let mut send_task = tokio::spawn(async move {
@@ -51,10 +47,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             match msg {
                 Message::Text(_) => {
                     // Send current scores if available
-                    if let Ok(scores) = state_clone.scores.lock() {
+                    if let Ok(scores) = state.scores.lock() {
                         if let Some(score_data) = scores.as_ref() {
                             if let Ok(json) = serde_json::to_string(score_data) {
-                                tx.send(Message::Text(json)).ok();
+                                state.score_tx.send(Message::Text(json)).ok();
                             }
                         }
                     }

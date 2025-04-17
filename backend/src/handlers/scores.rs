@@ -1,5 +1,5 @@
 use axum::{
-    extract::State,
+    extract::{State, ws::Message},
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,11 @@ pub async fn receive_scores_handler(
     // Update scores in shared state
     let mut scores = state.scores.lock().unwrap();
     *scores = Some(score_data.clone());
+
+    // Broadcast the score update to all connected WebSocket clients
+    if let Ok(json) = serde_json::to_string(&score_data) {
+        state.score_tx.send(Message::Text(json)).ok();
+    }
 
     Json(score_data)
 }

@@ -3,14 +3,6 @@
   
   export let scores: Record<string, string> = {};
   export let variant: 'semi' | 'final' = 'semi';
-
-  // Debug function to check what's in the scores object
-  function debugScoreEntries(): void {
-    console.log(`ScoreOverlay received scores:`, scores);
-    console.log(`Keys: ${Object.keys(scores).join(', ')}`);
-    console.log(`Entries: ${JSON.stringify(Object.entries(scores))}`);
-  }
-  $: debugScoreEntries();
 </script>
 
 <div class="score-overlay" class:final={variant === 'final'}>

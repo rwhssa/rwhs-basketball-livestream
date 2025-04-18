@@ -793,16 +793,12 @@
                             `video-final-${activeStream.participant.sid}`,
                         )}
                     </div>
-                    <!-- Score overlay for Finals -->
                     {#if $scores?.scores?.final}
                         <div class="overlay-wrapper">
                           <!-- Add key to force reactivity -->
                           {#key JSON.stringify($scores.scores.final)}
                             <ScoreOverlay scores={$scores.scores.final} variant="final" />
                           {/key}
-                          <div class="debug-scores" style="background: rgba(0,0,0,0.8); color: white; padding: 5px; font-size: 10px; margin-top: 5px; border-radius: 3px;">
-                            Final Scores: {JSON.stringify($scores.scores.final)}
-                          </div>
                         </div>
                     {/if}
                 {/key}

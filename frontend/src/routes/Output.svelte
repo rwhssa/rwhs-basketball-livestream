@@ -17,12 +17,29 @@
         type StreamInfo,
     } from "../stores/streams";
     import ScoreOverlay from "../components/ScoreOverlay.svelte";
+    import { validateScores } from "../lib/debugger";
 
     // --- State ---
     let localRoom: Room | null = $state(null);
     let wsConnection: WebSocket | null = $state(null);
     let allStreams = $state<StreamInfo[]>([]);
     let activeSourceSid = $state<string | null>(null);
+
+    // Initialize scores with empty structure to ensure reactivity
+    $effect(() => {
+        // Initialize the scores structure if it's empty
+        if (!$scores.scores || Object.keys($scores.scores).length === 0) {
+            console.log("Initializing empty scores structure");
+            $scores = {
+                phase: $mode,
+                scores: {
+                    game1: {},
+                    game2: {},
+                    final: {}
+                }
+            };
+        }
+    });
 
     // Ensure StreamInfo.participant is never undefined
     interface SafeStreamInfo extends StreamInfo {
@@ -205,11 +222,68 @@
                     }
 
                     // Process score updates
-                    $scores = data; // Update score store
+                    console.log("Received WebSocket data:", data);
+                    
+                    // Check if this message contains a score update
+                    if (data.scores !== undefined) {
+                        // Handle the structured score data format directly
+                        // This matches the expected format from the backend
+                        console.log("Received structured score data:", data);
+                        
+                        // Validate the score data before updating the store
+                        if (validateScores(data)) {
+                            $scores = data;
+                            console.log("Updated scores with validated data:", data);
+                        } else {
+                            console.error("Invalid score data structure:", data);
+                        }
+                    } else if (!data.action && typeof data === 'object') {
+                        // If data doesn't have scores or action but is an object, 
+                        // try to adapt it to the expected format
+                        
+                        // Create a properly formatted score object
+                        const scoreData = {
+                            phase: data.phase || $mode,
+                            scores: { ...$scores.scores }
+                        };
+                        
+                        // If the object has class scores directly, add them to the appropriate game
+                        if (Object.keys(data).length > 0 && 
+                            Object.keys(data).every(key => typeof data[key] === 'string')) {
+                            
+                            if ($mode === "semi") {
+                                // Determine which game to update
+                                if (!scoreData.scores.game1 || 
+                                    Object.keys(scoreData.scores.game1).length === 0) {
+                                    scoreData.scores.game1 = data;
+                                    console.log("Updated game1 scores with direct class data:", data);
+                                } else if (!scoreData.scores.game2 || 
+                                          Object.keys(scoreData.scores.game2).length === 0) {
+                                    scoreData.scores.game2 = data;
+                                    console.log("Updated game2 scores with direct class data:", data);
+                                }
+                            } else {
+                                // Final mode
+                                scoreData.scores.final = data;
+                                console.log("Updated final scores with direct class data:", data);
+                            }
+                            
+                            // Validate the constructed score data
+                            if (validateScores(scoreData)) {
+                                $scores = scoreData;
+                                console.log("Updated scores with adapted data:", scoreData);
+                            } else {
+                                console.error("Constructed invalid score data:", scoreData);
+                            }
+                        }
+                    }
                     if (data.phase && data.phase !== $mode) {
                         console.log("Mode changed via WebSocket:", data.phase);
                         $mode = data.phase; // Update mode store
                     }
+                    
+                    // Debug current scores state
+                    console.log("Current scores state:", $scores);
                 } catch (err) {
                     console.error("Error processing WebSocket message:", err);
                 }
@@ -650,10 +724,12 @@
                                     `video-game1-${stream.participant.sid}`,
                                 )}
                             </div>
-                            <!-- Score overlay for Game 1 -->
                             {#if $scores?.scores?.game1}
                                 <div class="overlay-wrapper">
-                                    <ScoreOverlay scores={$scores.scores.game1} variant="semi" />
+                                    <!-- Add key to force reactivity -->
+                                    {#key JSON.stringify($scores.scores.game1)}
+                                        <ScoreOverlay scores={$scores.scores.game1} variant="semi" />
+                                    {/key}
                                 </div>
                             {/if}
                         {/key}
@@ -683,10 +759,12 @@
                                     `video-game2-${stream.participant.sid}`,
                                 )}
                             </div>
-                            <!-- Score overlay for Game 2 -->
                             {#if $scores?.scores?.game2}
                                 <div class="overlay-wrapper">
-                                    <ScoreOverlay scores={$scores.scores.game2} variant="semi" />
+                                    <!-- Add key to force reactivity -->
+                                    {#key JSON.stringify($scores.scores.game2)}
+                                        <ScoreOverlay scores={$scores.scores.game2} variant="semi" />
+                                    {/key}
                                 </div>
                             {/if}
                         {/key}
@@ -718,7 +796,13 @@
                     <!-- Score overlay for Finals -->
                     {#if $scores?.scores?.final}
                         <div class="overlay-wrapper">
-                          <ScoreOverlay scores={$scores.scores.final} variant="final" />
+                          <!-- Add key to force reactivity -->
+                          {#key JSON.stringify($scores.scores.final)}
+                            <ScoreOverlay scores={$scores.scores.final} variant="final" />
+                          {/key}
+                          <div class="debug-scores" style="background: rgba(0,0,0,0.8); color: white; padding: 5px; font-size: 10px; margin-top: 5px; border-radius: 3px;">
+                            Final Scores: {JSON.stringify($scores.scores.final)}
+                          </div>
                         </div>
                     {/if}
                 {/key}
